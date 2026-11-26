@@ -1,0 +1,62 @@
+# ---------- Node / Next.js ----------
+node_modules/
+.next/
+out/
+build/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.vercel/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---------- Secrets ----------
+.env
+.env.*
+!.env.example
+
+# ---------- Model weights & caches (these live on the GPU server only) ----------
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.gguf
+*.trt
+*.engine
+*.npz
+models/
+weights/
+checkpoints/
+.cache/
+hf_cache/
+
+# ---------- Voice samples (may be licensed; keep out of git by default) ----------
+server/personaplex/voices/*
+!server/personaplex/voices/.gitkeep
+
+# ---------- Recordings / logs ----------
+*.log
+recordings/
+
+# ---------- OS / editor ----------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
