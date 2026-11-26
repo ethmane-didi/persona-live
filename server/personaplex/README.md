@@ -44,7 +44,8 @@ GPU matters as much as the VRAM. If the voice stutters, rent a faster card.
 
 1. RunPod → **Pods → Deploy** → pick the GPU.
 2. **Template:** "RunPod PyTorch" (Ubuntu 22.04 + CUDA 12.x). Any template with Python ≥ 3.10 and an NVIDIA driver works.
-3. **Volume disk (mounted at `/workspace`): 60 GB.** The weights (~16 GB) and Python env (~6 GB) go here. The *container* disk is wiped when the pod stops; the volume isn't.
+3. **Volume disk (mounted at `/workspace`): 60 GB.** The PersonaPlex code and weights (~16 GB) go here. The volume survives a stop, but it's often a slow network filesystem.
+   **Container disk: 30 GB.** The Python env (~6 GB) goes here at `/root/venvs/personaplex`, because importing PyTorch from the network volume takes minutes. The container disk is wiped when the pod stops, so the env gets rebuilt after a restart (see step 3).
 4. **Expose HTTP ports:** add **`8998`**. RunPod then gives you a public HTTPS URL for the web UI.
 5. Deploy, then click **Connect → Start Web Terminal** (or SSH).
 
@@ -84,7 +85,7 @@ What it does, step by step (re-running is safe, since finished steps are skipped
 | 2 | `apt install libopus-dev …` | Opus is the audio codec the browser and server stream with |
 | 3 | Checks Python ≥ 3.10 | PersonaPlex's minimum |
 | 4 | Clones PersonaPlex to `/workspace/personaplex` | The model's code |
-| 5 | Creates a venv at `/workspace/venvs/personaplex` | Keeps exact library versions isolated, and on the persistent disk |
+| 5 | Creates a venv at `/root/venvs/personaplex` (local container disk) | Keeps exact library versions isolated. Local disk makes `import torch` take seconds instead of minutes |
 | 6 | Installs PyTorch 2.4.1 (CUDA 12.4), then `pip install moshi/.` | PersonaPlex requires torch < 2.5. Blackwell GPUs get the CUDA 13 build instead |
 | 7 | Checks that PyTorch sees the GPU and prints the VRAM | Catches driver or CUDA problems early |
 | 8 | Downloads the weights (~16 GB) into `/workspace/hf_cache` | So the server starts fast, and a missing license acceptance shows up now |
@@ -92,6 +93,14 @@ What it does, step by step (re-running is safe, since finished steps are skipped
 It finishes by writing `/workspace/personaplex.env`. **In every new terminal, run
 `source /workspace/personaplex.env` first.** That turns on the venv and points to the
 weight cache.
+
+**After a pod stop/start:** the container disk is wiped, so the venv (and libopus) are
+gone. `source /workspace/personaplex.env` notices this and re-runs the setup script for
+you. That takes a few minutes, mostly reinstalling PyTorch. The code and weights on
+`/workspace` are reused, and `HF_TOKEN` isn't needed if the weights are already cached.
+
+**Upgrading from the old layout** (venv on `/workspace/venvs`): re-run the setup script
+once to create the new venv and env file, then `rm -rf /workspace/venvs` to free the space.
 
 ---
 
@@ -192,6 +201,8 @@ Then open **<http://localhost:8998>**. Browsers allow the mic on `localhost`.
 | Lumi drifts out of character in long chats | Expected: memory is a ~2.5-minute sliding window, though the system prompt stays pinned. Keep the runtime prompt short and clear |
 | `No space left on device` | Make the `/workspace` volume larger (60 GB+) |
 | New terminal: `python: No module named moshi` | Run `source /workspace/personaplex.env` |
+| Setup hangs at step 7, or `import torch` takes minutes | The venv is on the slow `/workspace` network volume. Pull the latest script (venv on `/root/venvs`) and re-run it |
+| `No space left on device` during pip install | The container disk is too small for the venv. Give the pod 30 GB+ of container disk |
 
 ---
 

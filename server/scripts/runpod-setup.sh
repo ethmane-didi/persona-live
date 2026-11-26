@@ -12,9 +12,15 @@
 #   2. pip install moshi/.            (PersonaPlex's Python package)
 #   3. accept the model license on Hugging Face + export HF_TOKEN
 #
-# Everything big goes under /workspace. On RunPod, /workspace is the persistent
-# volume; everything else is wiped when the pod stops. That way the ~16 GB of
-# weights and the Python env survive a stop/start.
+# Where things go:
+#   /workspace (persistent volume): PersonaPlex code + the ~16 GB of weights.
+#     It survives a stop/start, but on RunPod it's often a network filesystem,
+#     so reading thousands of small files from it is very slow.
+#   /root/venvs (local container disk): the Python env. `import torch` opens
+#     thousands of small files, which takes minutes on the network volume and
+#     seconds on local disk. The container disk is wiped when the pod stops, so
+#     after a restart the env is rebuilt: `source /workspace/personaplex.env`
+#     re-runs this script automatically when the venv is missing.
 # =============================================================================
 set -euo pipefail
 
@@ -23,9 +29,10 @@ WORKSPACE="${WORKSPACE:-/workspace}"
 PERSONAPLEX_REPO="${PERSONAPLEX_REPO:-https://github.com/NVIDIA/personaplex.git}"
 PERSONAPLEX_REF="${PERSONAPLEX_REF:-main}"          # pin a commit/tag here for reproducible installs
 PERSONAPLEX_MODEL="${PERSONAPLEX_MODEL:-nvidia/personaplex-7b-v1}"
-PP_DIR="$WORKSPACE/personaplex"                     # PersonaPlex source code
-VENV_DIR="$WORKSPACE/venvs/personaplex"             # isolated Python environment
-export HF_HOME="${HF_HOME:-$WORKSPACE/hf_cache}"    # where Hugging Face stores downloaded weights
+PP_DIR="$WORKSPACE/personaplex"                     # PersonaPlex source code (persistent)
+VENV_DIR="${PERSONAPLEX_VENV:-/root/venvs/personaplex}"  # Python env on LOCAL disk (fast, rebuilt after restart)
+export HF_HOME="${HF_HOME:-$WORKSPACE/hf_cache}"    # where Hugging Face stores downloaded weights (persistent)
+MODEL_CACHE="$HF_HOME/hub/models--${PERSONAPLEX_MODEL//\//--}"  # HF's folder for this model
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"        # persona-live repo root
@@ -42,7 +49,12 @@ command -v nvidia-smi >/dev/null || die "nvidia-smi not found. Is this a GPU pod
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader \
   | while read -r line; do info "GPU: $line"; done
 [[ -d "$WORKSPACE" ]] || die "$WORKSPACE not found. Attach a network/volume disk mounted at /workspace."
-info "Free space on $WORKSPACE: $(df -h "$WORKSPACE" | awk 'NR==2{print $4}') (need ~40 GB)"
+info "Free space on $WORKSPACE: $(df -h "$WORKSPACE" | awk 'NR==2{print $4}') (need ~25 GB for code + weights)"
+mkdir -p "$(dirname "$VENV_DIR")"
+info "Free space for the venv ($(dirname "$VENV_DIR")): $(df -h "$(dirname "$VENV_DIR")" | awk 'NR==2{print $4}') (need ~10 GB)"
+if [[ -d "$WORKSPACE/venvs/personaplex" ]]; then
+  info "Note: old venv found at $WORKSPACE/venvs/personaplex (no longer used). Remove it with: rm -rf $WORKSPACE/venvs"
+fi
 
 # ---------- 1. Hugging Face token ----------
 step "1/8  Hugging Face token"
@@ -53,14 +65,22 @@ if [[ -z "${HF_TOKEN:-}" && -f "$REPO_ROOT/.env" ]]; then
   set -a; # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"; set +a
 fi
-if [[ -z "${HF_TOKEN:-}" || "$HF_TOKEN" == hf_your-read-token ]]; then
+SKIP_DOWNLOAD=0
+if [[ -z "${HF_TOKEN:-}" || "$HF_TOKEN" == hf_your-read-token ]] && [[ -d "$MODEL_CACHE/snapshots" ]]; then
+  # Rebuilding the venv after a restart: the weights are already on /workspace,
+  # so the token isn't needed. Skip the download check in step 8.
+  SKIP_DOWNLOAD=1
+  info "No HF_TOKEN, but the weights are already cached in $MODEL_CACHE. Skipping the download step."
+elif [[ -z "${HF_TOKEN:-}" || "$HF_TOKEN" == hf_your-read-token ]]; then
   die "HF_TOKEN is not set.
     1. Accept the license: https://huggingface.co/$PERSONAPLEX_MODEL
     2. Create a READ token: https://huggingface.co/settings/tokens
     3. export HF_TOKEN=hf_...   (or put it in $REPO_ROOT/.env) and re-run."
 fi
-export HF_TOKEN
-info "HF_TOKEN found."
+if (( ! SKIP_DOWNLOAD )); then
+  export HF_TOKEN
+  info "HF_TOKEN found."
+fi
 
 # ---------- 2. System packages ----------
 step "2/8  System packages (libopus for audio, build tools, git)"
@@ -93,7 +113,8 @@ info "At commit $(git -C "$PP_DIR" rev-parse --short HEAD)"
 # ---------- 5. Python virtual environment ----------
 step "5/8  Python virtual environment -> $VENV_DIR"
 # A venv keeps PersonaPlex's exact library versions separate from whatever the
-# RunPod image ships with. It lives on /workspace so it survives restarts.
+# RunPod image ships with. It lives on the local container disk because Python
+# imports are far faster there than on the /workspace network volume.
 [[ -x "$VENV_DIR/bin/python" ]] || "$PY" -m venv "$VENV_DIR"
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
@@ -138,6 +159,9 @@ info "moshi package imports OK."
 step "8/8  Downloading $PERSONAPLEX_MODEL into $HF_HOME (first time: ~16 GB, a few minutes)"
 # Doing this now means the server starts fast later, and you find out right away
 # if the license hasn't been accepted. Already-downloaded files are skipped.
+if (( SKIP_DOWNLOAD )); then
+  info "Skipped (no HF_TOKEN; using the weights already in $MODEL_CACHE)."
+else
 python - "$PERSONAPLEX_MODEL" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
@@ -153,14 +177,25 @@ except RepositoryNotFoundError:
     sys.exit(f"\nERROR: {repo} not found, or your token can't see it. Check HF_TOKEN.")
 print(f"    Weights ready at {path}")
 PY
+fi
 
 # ---------- Save an env file so new terminals are ready to go ----------
+# The env file lives on /workspace (persistent), the venv on the container disk
+# (wiped on stop). So the env file checks for the venv and rebuilds it if a
+# restart wiped it. Re-running the whole script also reinstalls libopus, which
+# lived on the container disk too.
 ENV_FILE="$WORKSPACE/personaplex.env"
 cat > "$ENV_FILE" <<EOF
 # Created by runpod-setup.sh. Load in a new terminal with: source $ENV_FILE
 export HF_HOME="$HF_HOME"
 export PERSONAPLEX_DIR="$PP_DIR"
-source "$VENV_DIR/bin/activate"
+export PERSONAPLEX_VENV="$VENV_DIR"
+if [[ ! -x "\$PERSONAPLEX_VENV/bin/python" ]]; then
+  echo "Python env not found at \$PERSONAPLEX_VENV (the container disk is wiped when the pod stops)."
+  echo "Rebuilding it with runpod-setup.sh (a few minutes; code and weights on /workspace are reused)..."
+  bash "$SCRIPT_DIR/runpod-setup.sh" || { echo "Rebuild failed; see the errors above."; return 1; }
+fi
+source "\$PERSONAPLEX_VENV/bin/activate"
 EOF
 
 step "Done!"
