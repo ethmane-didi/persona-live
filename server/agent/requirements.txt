@@ -1,0 +1,14 @@
+# LiveKit agent (Phase 2). Installed into its own venv on the GPU pod by
+# server/scripts/agent-setup.sh. No torch here: the model runs in moshi.server.
+
+# LiveKit Agents framework + the livekit (rtc) SDK it pins. Apache-2.0.
+# Note: it pulls in livekit-local-inference, whose PyPI license is
+# "Apache-2.0 AND LicenseRef-LiveKit-Model" (bundled LiveKit models such as the
+# turn detector). This agent uses none of those models; review that license
+# before a commercial launch.
+livekit-agents==1.9.0
+# Ogg-Opus encode/decode. Same version range as moshi uses, so the audio format
+# matches the server byte for byte. Apache-2.0.
+sphn>=0.1.4,<0.2
+numpy>=1.26,<2.2
+python-dotenv>=1.0
