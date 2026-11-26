@@ -1,7 +1,10 @@
 # server/scripts: GPU server setup
 
-`runpod-setup.sh` (added in phase 1) prepares a fresh RunPod GPU instance:
-system packages, Python env, PersonaPlex install and weight download.
+`runpod-setup.sh` prepares a fresh RunPod GPU pod for Phase 1. It installs system
+packages, creates a Python venv, installs PersonaPlex, and downloads the weights.
+Everything goes onto the persistent `/workspace` volume.
 
-- **Run on the GPU server only:** `bash server/scripts/runpod-setup.sh`
-- Never run this on the local Mac. It downloads multi-GB model weights.
+- **Run on the GPU pod only:** `bash server/scripts/runpod-setup.sh`
+- Needs `HF_TOKEN` (env var or `.env`) and the PersonaPlex license accepted on Hugging Face.
+- Refuses to run on macOS. It downloads ~16 GB of weights.
+- Full walkthrough: [server/personaplex/README.md](../personaplex/README.md)
