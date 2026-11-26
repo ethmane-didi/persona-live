@@ -128,17 +128,23 @@ COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -
 COMPUTE_MAJOR="${COMPUTE_CAP%%.*}"
 info "GPU compute capability: $COMPUTE_CAP"
 
+# Extra packages installed next to moshi:
+#   accelerate:  only needed for --cpu-offload, but it's small and handy.
+#   hf_transfer: the RunPod PyTorch template sets HF_HUB_ENABLE_HF_TRANSFER=1,
+#                and huggingface_hub then refuses to download without it. It's
+#                also a faster downloader for the ~16 GB of weights.
+EXTRA_PKGS=(accelerate hf_transfer)
+
 if (( COMPUTE_MAJOR >= 10 )); then
   info "Blackwell GPU: following the README's extra step (PyTorch cu130)."
-  pip install --quiet "$PP_DIR/moshi/." accelerate
+  pip install --quiet "$PP_DIR/moshi/." "${EXTRA_PKGS[@]}"
   pip install --quiet torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 else
   # PersonaPlex pins torch < 2.5. Installing it first from the CUDA 12.4 index
   # (same CUDA as NVIDIA's own Dockerfile) avoids pip picking a mismatched build.
   info "Installing torch 2.4.1 (CUDA 12.4 build)."
   pip install --quiet "torch==2.4.1" --index-url https://download.pytorch.org/whl/cu124
-  # accelerate is only needed for --cpu-offload, but it's small and handy.
-  pip install --quiet "$PP_DIR/moshi/." accelerate
+  pip install --quiet "$PP_DIR/moshi/." "${EXTRA_PKGS[@]}"
 fi
 
 # ---------- 7. Verify the GPU is usable from Python ----------
