@@ -1,0 +1,27 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+/* LiveKit's <BarVisualizer> renders unstyled divs (we don't load
+   @livekit/components-styles). Bar heights come from inline styles;
+   data-lk-highlighted marks the bars lit by Lumi's voice. */
+.lk-audio-bar-visualizer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+}
+
+.lk-audio-bar {
+  width: 0.5rem;
+  min-height: 0.5rem;
+  border-radius: 9999px;
+  background-color: rgb(255 255 255 / 0.15);
+  transition: background-color 150ms ease, height 100ms ease;
+}
+
+.lk-audio-bar[data-lk-highlighted="true"] {
+  background-color: rgb(167 139 250); /* violet-400 */
+}

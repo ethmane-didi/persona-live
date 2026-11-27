@@ -27,6 +27,7 @@ env/
 .env
 .env.*
 !.env.example
+!.env.local.example
 
 # ---------- Model weights & caches (these live on the GPU server only) ----------
 *.safetensors
