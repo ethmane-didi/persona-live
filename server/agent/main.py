@@ -1,12 +1,20 @@
-"""LiveKit agent: bridges a LiveKit room to PersonaPlex (Phase 2).
+"""LiveKit agent: bridges a LiveKit room to PersonaPlex, MuseTalk and a vision model.
 
-    browser mic ──WebRTC──▶ LiveKit ──▶ this agent ──ws://127.0.0.1:8998──▶ moshi.server
-    browser speaker ◀────── LiveKit ◀── this agent ◀── Lumi's voice + text ──┘
+    browser mic ──WebRTC──▶ LiveKit ──▶ agent ──ws://127.0.0.1:8998──▶ moshi.server (PersonaPlex)
+    browser camera ───────▶ LiveKit ──▶ agent ──http://127.0.0.1:8997──▶ vision service (once, at the start)
+    browser ◀── Lumi's voice + video ── agent ◀──ws://127.0.0.1:8999──── face service (MuseTalk)
 
-It joins each new room, waits for the user, opens one PersonaPlex conversation with
-the runtime prompt from prompts/persona.md, then streams audio both ways at the
-same time. It does no turn-taking or voice-activity detection: PersonaPlex is
-full-duplex and handles interruptions (barge-in) inside the model.
+It joins each new room and waits for the user. If their camera is on, it grabs one
+frame and asks the vision service to describe it; that sentence is added to the
+runtime prompt from prompts/persona.md. Then it opens one PersonaPlex conversation
+and streams audio both ways at the same time. It does no turn-taking or
+voice-activity detection: PersonaPlex is full-duplex and handles interruptions
+(barge-in) inside the model.
+
+Lumi's voice also goes to the face service, which returns lip-synced video. The
+voice is held back until its video frame exists, so they stay in sync. Every
+GPU service is optional: without the face service she's voice-only, without the
+vision service she can't see the user.
 
 Run on the GPU pod (see server/agent/README.md):
     python main.py dev
@@ -33,7 +41,10 @@ from livekit.agents.types import (
     TOPIC_TRANSCRIPTION,
 )
 
+from face_client import FaceError, FaceStream
+from output import AudioOutput, VideoOutput
 from personaplex_client import PersonaPlexError, PersonaPlexSession
+from vision_client import capture_camera_frame, describe_frame, prompt_with_vision
 from voice_backend import SAMPLE_RATE, AudioOut, Pcm, TextOut, VoiceSession
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +57,11 @@ from runtime_prompt import load_runtime_prompt  # noqa: E402
 PERSONAPLEX_WS_URL = os.getenv("PERSONAPLEX_WS_URL", "ws://127.0.0.1:8998/api/chat")
 PERSONAPLEX_VOICE = os.getenv("PERSONAPLEX_VOICE", "NATF2.pt")  # "Natural female 2" preset
 PERSONA_PROMPT_PATH = REPO_ROOT / os.getenv("PERSONA_PROMPT_PATH", "prompts/persona.md")
+# Optional GPU services on the same pod. Set to an empty string to turn one off.
+FACE_WS_URL = os.getenv("FACE_WS_URL", "ws://127.0.0.1:8999/stream")
+VISION_URL = os.getenv("VISION_URL", "http://127.0.0.1:8997/describe")
+# How long to wait for a camera frame when the user joins (camera off = no frames).
+CAMERA_WAIT_S = 3.0
 
 # If the mic sends nothing for this long (user muted, network blip), feed the model
 # silence. PersonaPlex only moves forward when it receives audio, so without this
@@ -66,15 +82,26 @@ def frame_to_pcm(frame: rtc.AudioFrame) -> Pcm:
     return np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def pcm_to_frame(pcm: Pcm) -> rtc.AudioFrame:
-    """float32 in [-1, 1] -> LiveKit int16 frame at 24 kHz mono."""
-    samples = (np.clip(pcm, -1.0, 1.0) * 32767.0).astype(np.int16)
-    return rtc.AudioFrame(
-        data=samples.tobytes(),
-        sample_rate=SAMPLE_RATE,
-        num_channels=1,
-        samples_per_channel=samples.shape[-1],
-    )
+async def see_user(user: rtc.RemoteParticipant) -> tuple[str | None, bool]:
+    """One camera frame -> (description or None, whether the camera was on)."""
+    cameras = [
+        pub for pub in user.track_publications.values() if pub.source == rtc.TrackSource.SOURCE_CAMERA
+    ]
+    if not cameras:
+        logger.info("the user's camera is off")
+        return None, False
+    if not VISION_URL:
+        return None, True
+    frame = await capture_camera_frame(user, wait_s=CAMERA_WAIT_S)
+    # One frame is all we use, so stop receiving their video for the rest of the call.
+    for pub in cameras:
+        pub.set_subscribed(False)
+    if frame is None:
+        logger.info("the user's camera is on, but no frame arrived in time")
+        return None, True
+    description = await describe_frame(frame, VISION_URL)
+    logger.info("Lumi sees: %s", description or "(vision service unavailable)")
+    return description, True
 
 
 class CaptionStreamer:
@@ -131,12 +158,14 @@ async def set_agent_state(ctx: JobContext, state: str) -> None:
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext) -> None:
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    # Audio and video: the user's camera feeds the "describe you at the start" step.
+    await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_ALL)
     await set_agent_state(ctx, "initializing")
     user = await ctx.wait_for_participant()
     logger.info("room %s: user %s joined", ctx.room.name, user.identity)
 
-    text_prompt = load_runtime_prompt(PERSONA_PROMPT_PATH)
+    description, camera_on = await see_user(user)
+    text_prompt = prompt_with_vision(load_runtime_prompt(PERSONA_PROMPT_PATH), description, camera_on)
     voice: VoiceSession = PersonaPlexSession(PERSONAPLEX_WS_URL, text_prompt, PERSONAPLEX_VOICE)
     # Always release PersonaPlex when the job ends: it serves one conversation at a time.
     ctx.add_shutdown_callback(voice.aclose)
@@ -162,6 +191,27 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.error("%s", e)
         ctx.shutdown(f"PersonaPlex unavailable: {e}")
         return
+
+    # Lumi's face, if the face service is running; otherwise she's voice-only.
+    output: AudioOutput | VideoOutput = AudioOutput(source)
+    if FACE_WS_URL:
+        face = FaceStream(FACE_WS_URL)
+        try:
+            fmt = await face.start()
+            video_source = rtc.VideoSource(fmt.width, fmt.height)
+            video_track = rtc.LocalVideoTrack.create_video_track("lumi-face", video_source)
+            video_pub = await ctx.room.local_participant.publish_track(
+                video_track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA)
+            )
+
+            async def drop_video() -> None:
+                # The page falls back to its voice-only tile when the track goes away.
+                await ctx.room.local_participant.unpublish_track(video_pub.sid)
+
+            output = VideoOutput(face, source, video_source, on_failure=drop_video)
+            ctx.add_shutdown_callback(output.aclose)
+        except FaceError as e:
+            logger.warning("%s; Lumi is voice-only this time", e)
     await set_agent_state(ctx, "listening")
 
     # The user's mic, resampled by LiveKit to 24 kHz mono.
@@ -193,7 +243,7 @@ async def entrypoint(ctx: JobContext) -> None:
         async for event in voice.events():
             if isinstance(event, AudioOut):
                 stats["out_s"] += event.pcm.shape[-1] / SAMPLE_RATE
-                await source.capture_frame(pcm_to_frame(event.pcm))
+                await output.push(event.pcm)
             elif isinstance(event, TextOut):
                 await captions.add(event.text)
         await captions.flush()
@@ -201,14 +251,17 @@ async def entrypoint(ctx: JobContext) -> None:
     async def log_stats() -> None:
         # Every 10 s: audio sent vs received. They should grow at the same rate;
         # if "lumi" falls behind "mic", the GPU isn't keeping up with real time.
+        # "face delay" is how long her voice is held back for the video (0 when voice-only).
         while True:
             await asyncio.sleep(10)
             logger.info(
-                "audio so far: mic %.1f s (+%.1f s silence fill), lumi %.1f s, playback queue %.0f ms",
-                stats["mic_s"], stats["fill_s"], stats["out_s"], source.queued_duration * 1000,
+                "audio so far: mic %.1f s (+%.1f s silence fill), lumi %.1f s, "
+                "playback queue %.0f ms, face delay %.0f ms",
+                stats["mic_s"], stats["fill_s"], stats["out_s"],
+                source.queued_duration * 1000, output.delay_s() * 1000,
             )
 
-    tasks = [asyncio.create_task(t()) for t in (read_mic, send_mic, play_persona, log_stats)]
+    tasks = [asyncio.create_task(t()) for t in (read_mic, send_mic, play_persona, output.run, log_stats)]
     try:
         # play_persona ends when PersonaPlex closes the connection; any task
         # failing also ends the conversation.

@@ -1,0 +1,9 @@
+# Vision service (Phase 3). Own venv at /root/venvs/vision, created by
+# server/scripts/vision-setup.sh. Versions get pinned in the first GPU session.
+
+# PyTorch comes from the CUDA index in vision-setup.sh, not from here.
+transformers>=4.50  # SmolVLM2 support
+accelerate
+pillow
+num2words  # needed by the SmolVLM processor
+aiohttp>=3.10

@@ -50,6 +50,10 @@ hf_cache/
 server/personaplex/voices/*
 !server/personaplex/voices/.gitkeep
 
+# ---------- Likeness videos / prepared avatars (licensed; never commit) ----------
+likeness/
+face_avatars/
+
 # ---------- Recordings / logs ----------
 *.log
 recordings/
