@@ -2,6 +2,12 @@
 
 *Nov 26, 2026 · Ousman*
 
+> **Update, Nov 27, 2026:** Phase 3 switched from Audio2Face to **MuseTalk 1.5**
+> because Lumi needs a photoreal face, like a real person on a video call. Audio2Face
+> only drives a 3D character with blendshapes (see "One catch" below). MuseTalk
+> lip-syncs a looping video of an original or licensed likeness instead. The Audio2Face
+> notes below are kept as background.
+
 Partly possible. Every piece of software can be free and open, but running it isn't. This needs a real NVIDIA GPU, and an 8GB Mac can't run it. The usual "free" route is free code plus cheap or free GPU time.
 
 ## Nuance Labs: not open source
